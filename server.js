@@ -252,6 +252,10 @@ function pollInbox() {
                 .eq('ticket_id', ticketId);
 
               console.log('✅ Ticket ' + ticketId + ' auto-closed. Duration: ' + duration);
+
+              // Notify the staff member who logged the ticket
+              await notifyStaff(ticket, parsed.text || '', from, duration);
+
               if (uid) seen.push(uid);
             } catch (e) {
               console.error('Parse error:', e.message);
@@ -268,6 +272,45 @@ function pollInbox() {
   });
 
   imap.connect();
+}
+
+// ── Notify staff member when their ticket is closed ─────────
+async function notifyStaff(ticket, replyText, repliedBy, duration) {
+  if (!ticket.staff_email) return;
+  try {
+    const excerpt = replyText ? replyText.substring(0, 500).trim() : '';
+    const closeLink = 'https://fortunate-flow-production-d5e8.up.railway.app/close-link/' + ticket.ticket_id;
+
+    const bodyText =
+`Your support ticket has been resolved.
+
+═══════════════════════════════════════
+Ticket Number : ${ticket.ticket_id}
+Topic         : ${ticket.topic}
+Resolved by   : ${repliedBy}
+Resolution time: ${duration}
+═══════════════════════════════════════
+
+${excerpt ? 'RESPONSE FROM SUPPORT:\n' + excerpt + '\n\n───────────────────────────────────────\n' : ''}Your ticket has been marked as closed. If you need further assistance, please log a new ticket.
+
+Acquifin Holdings — Support Ticket System`;
+
+    const msg = {
+      to:   ticket.staff_email,
+      from: {
+        email: process.env.MAIL_USER,
+        name:  'Acquifin Tickets'
+      },
+      replyTo: process.env.TICKET_TO_EMAIL,
+      subject: '[' + ticket.ticket_id + '] Resolved — ' + ticket.topic,
+      text:    bodyText
+    };
+
+    await sgMail.send(msg);
+    console.log('📧 Staff notified: ' + ticket.staff_email + ' — ticket ' + ticket.ticket_id + ' resolved');
+  } catch (err) {
+    console.error('Staff notification failed:', err.message);
+  }
 }
 
 function formatDuration(ms) {
