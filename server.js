@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express        = require('express');
-const nodemailer     = require('nodemailer');
+const sgMail         = require('@sendgrid/mail');
 const cron           = require('node-cron');
 const Imap           = require('imap');
 const { simpleParser } = require('mailparser');
@@ -9,22 +9,14 @@ const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// ── Supabase (service role) ──────────────────────────────────
+// ── SendGrid (HTTPS — works from Railway) ────────────────────
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+// ── Supabase ─────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
-// ── Gmail SMTP transporter ───────────────────────────────────
-const transporter = nodemailer.createTransport({
-  host:   'smtp.gmail.com',
-  port:   465,
-  secure: true,
-  auth: {
-    user: process.env.MAIL_USER,   // acquifin.tickets@gmail.com
-    pass: process.env.MAIL_PASS    // 16-char app password
-  }
-});
 
 // ── Middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -79,7 +71,7 @@ app.get('/close-link/:id', async (req, res) => {
   }
 });
 
-// ── Manual close (admin button) ──────────────────────────────
+// ── Manual close (admin) ─────────────────────────────────────
 app.post('/close/:id', async (req, res) => {
   try {
     const ticketId = req.params.id;
@@ -98,7 +90,7 @@ app.post('/close/:id', async (req, res) => {
   }
 });
 
-// ── GET tickets (frontend sync) ──────────────────────────────
+// ── GET tickets ──────────────────────────────────────────────
 app.get('/tickets', async (req, res) => {
   try {
     const email   = req.query.email;
@@ -145,12 +137,12 @@ async function sendTicketEmail(ticket) {
     low:      'Low — No direct production impact'
   };
 
-  const prioLabel  = prioLabels[ticket.priority] || ticket.priority;
-  const ccList     = Array.isArray(ticket.cc)      ? ticket.cc      : [];
-  const sysList    = Array.isArray(ticket.systems) ? ticket.systems : [];
-  const sysLine    = sysList.length ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
-  const ccLine     = ccList.length  ? '\nCC                    : ' + ccList.join(', ')  : '';
-  const closeLink  = 'https://fortunate-flow-production-d5e8.up.railway.app/close-link/' + ticket.ticket_id;
+  const prioLabel = prioLabels[ticket.priority] || ticket.priority;
+  const ccList    = Array.isArray(ticket.cc)      ? ticket.cc      : [];
+  const sysList   = Array.isArray(ticket.systems) ? ticket.systems : [];
+  const sysLine   = sysList.length ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
+  const ccLine    = ccList.length  ? '\nCC                    : ' + ccList.join(', ')  : '';
+  const closeLink = 'https://fortunate-flow-production-d5e8.up.railway.app/close-link/' + ticket.ticket_id;
 
   const bodyText =
 `ACQUIFIN HOLDINGS — SUPPORT TICKET
@@ -175,17 +167,20 @@ The ticket will be marked as closed automatically.
 Ticket reference: ${ticket.ticket_id}
 ───────────────────────────────────────`;
 
-  const mailOptions = {
-    from:    '"Acquifin Tickets" <' + process.env.MAIL_USER + '>',
+  const msg = {
     to:      process.env.TICKET_TO_EMAIL,
-    cc:      ccList.length ? ccList.join(', ') : undefined,
+    from: {
+      email: process.env.MAIL_USER,    // acquifin.tickets@gmail.com (verified in SendGrid)
+      name:  'Acquifin Tickets'
+    },
+    cc:      ccList.length ? ccList : undefined,
     replyTo: process.env.MAIL_USER,
     subject: '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
     text:    bodyText
   };
 
   try {
-    await transporter.sendMail(mailOptions);
+    await sgMail.send(msg);
     console.log('✅ Email sent: ' + ticket.ticket_id + ' → ' + process.env.TICKET_TO_EMAIL);
 
     const timeline = ticket.timeline || [];
@@ -195,12 +190,13 @@ Ticket reference: ${ticket.ticket_id}
       .eq('ticket_id', ticket.ticket_id);
 
   } catch (err) {
-    console.error('❌ Email failed for ' + ticket.ticket_id + ':', err.message);
+    const detail = err.response ? JSON.stringify(err.response.body) : err.message;
+    console.error('❌ SendGrid failed for ' + ticket.ticket_id + ':', detail);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// IMAP — poll Gmail inbox for replies (every 3 minutes)
+// IMAP — poll Gmail for replies (every 3 minutes)
 // ═══════════════════════════════════════════════════════════════
 function pollInbox() {
   const imap = new Imap({
@@ -237,14 +233,14 @@ function pollInbox() {
               const subject = parsed.subject || '';
               const from    = parsed.from?.text || '';
               const match   = subject.match(/\[?(TKT-\d{4}-\d{4})\]?/i);
-              if (!match) return;
+              if (!match) { if (uid) seen.push(uid); return; }
 
               const ticketId = match[1];
-              console.log('Reply for ' + ticketId + ' from ' + from);
+              console.log('📩 Reply for ' + ticketId + ' from ' + from);
 
               const { data: ticket } = await supabase
                 .from('ticket_mail').select('*').eq('ticket_id', ticketId).single();
-              if (!ticket || ticket.status === 'closed') return;
+              if (!ticket || ticket.status === 'closed') { if (uid) seen.push(uid); return; }
 
               const now      = new Date().toISOString();
               const duration = formatDuration(new Date(now) - new Date(ticket.created_at));
