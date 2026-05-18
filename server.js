@@ -167,16 +167,35 @@ The ticket will be marked as closed automatically.
 Ticket reference: ${ticket.ticket_id}
 ───────────────────────────────────────`;
 
+  // Build attachments from stored dataUrls
+  const attachments = [];
+  if (Array.isArray(ticket.attachments) && ticket.attachments.length) {
+    for (const att of ticket.attachments) {
+      if (att.data && att.data.includes(',')) {
+        const base64 = att.data.split(',')[1];
+        if (base64) {
+          attachments.push({
+            content:     base64,
+            filename:    att.name,
+            type:        att.type || 'application/octet-stream',
+            disposition: 'attachment'
+          });
+        }
+      }
+    }
+  }
+
   const msg = {
     to:      process.env.TICKET_TO_EMAIL,
     from: {
-      email: process.env.MAIL_USER,    // acquifin.tickets@gmail.com (verified in SendGrid)
+      email: process.env.MAIL_USER,
       name:  'Acquifin Tickets'
     },
-    cc:      ccList.length ? ccList : undefined,
-    replyTo: process.env.MAIL_USER,
-    subject: '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
-    text:    bodyText
+    cc:          ccList.length ? ccList : undefined,
+    replyTo:     process.env.MAIL_USER,
+    subject:     '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
+    text:        bodyText,
+    attachments: attachments.length ? attachments : undefined
   };
 
   try {
