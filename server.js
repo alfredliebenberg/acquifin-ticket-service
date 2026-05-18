@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express        = require('express');
-const nodemailer     = require('nodemailer');
+const sgMail         = require('@sendgrid/mail');
 const cron           = require('node-cron');
 const Imap           = require('imap');
 const { simpleParser } = require('mailparser');
@@ -9,25 +9,16 @@ const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// ── Supabase (service role — bypasses RLS) ───────────────────
+// ── SendGrid ─────────────────────────────────────────────────
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+// ── Supabase (service role) ──────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// ── SMTP transporter ─────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  host:   process.env.MAIL_HOST,
-  port:   parseInt(process.env.MAIL_SMTP_PORT || '465'),
-  secure: true,
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS
-  },
-  tls: { rejectUnauthorized: false }
-});
-
-// ── CORS — allow file:// (null origin) and everything else ───
+// ── Middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -42,7 +33,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'Acquifin Ticket Service running', time: new Date().toISOString() });
 });
 
-// ── Manual close endpoint (admin button in HTML) ─────────────
+// ── Manual close (admin) ─────────────────────────────────────
 app.post('/close/:id', async (req, res) => {
   try {
     const ticketId = req.params.id;
@@ -61,7 +52,7 @@ app.post('/close/:id', async (req, res) => {
   }
 });
 
-// ── GET tickets (for HTML frontend sync) ─────────────────────
+// ── GET tickets ──────────────────────────────────────────────
 app.get('/tickets', async (req, res) => {
   try {
     const email   = req.query.email;
@@ -77,12 +68,10 @@ app.get('/tickets', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// POLL SUPABASE — pick up new tickets and send emails
-// Runs every 30 seconds
+// POLL SUPABASE — send emails for new tickets (every 30 seconds)
 // ═══════════════════════════════════════════════════════════════
 async function processNewTickets() {
   try {
-    // Find tickets that haven't had emails sent yet
     const { data: tickets, error } = await supabase
       .from('ticket_mail')
       .select('*')
@@ -93,7 +82,6 @@ async function processNewTickets() {
     if (!tickets || tickets.length === 0) return;
 
     console.log('Found ' + tickets.length + ' unsent ticket(s)');
-
     for (const ticket of tickets) {
       await sendTicketEmail(ticket);
     }
@@ -112,10 +100,10 @@ async function sendTicketEmail(ticket) {
   };
 
   const prioLabel = prioLabels[ticket.priority] || ticket.priority;
-  const ccList    = Array.isArray(ticket.cc) ? ticket.cc : [];
+  const ccList    = Array.isArray(ticket.cc)      ? ticket.cc      : [];
   const sysList   = Array.isArray(ticket.systems) ? ticket.systems : [];
-  const sysLine   = sysList.length  ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
-  const ccLine    = ccList.length   ? '\nCC                    : ' + ccList.join(', ')  : '';
+  const sysLine   = sysList.length ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
+  const ccLine    = ccList.length  ? '\nCC                    : ' + ccList.join(', ')  : '';
 
   const bodyText =
 `ACQUIFIN HOLDINGS — SUPPORT TICKET
@@ -137,63 +125,45 @@ Your reply will automatically mark the ticket as resolved.
 Ticket reference: ${ticket.ticket_id}
 ───────────────────────────────────────`;
 
-  const mailOptions = {
-    from:    '"Acquifin Tickets" <' + process.env.MAIL_USER + '>',
-    to:      process.env.TICKET_TO_EMAIL,
-    cc:      ccList.length ? ccList.join(', ') : undefined,
-    replyTo: process.env.MAIL_USER,
-    subject: '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
-    text:    bodyText,
-    headers: { 'X-Ticket-ID': ticket.ticket_id }
+  const msg = {
+    to:       process.env.TICKET_TO_EMAIL,
+    from: {
+      email:  process.env.MAIL_USER,           // tickets@acquifinholdings.co.za
+      name:   'Acquifin Tickets'
+    },
+    cc:       ccList.length ? ccList : undefined,
+    replyTo:  process.env.MAIL_USER,
+    subject:  '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
+    text:     bodyText,
   };
 
   try {
-    await transporter.sendMail(mailOptions);
-    console.log('Email sent for ticket ' + ticket.ticket_id);
+    await sgMail.send(msg);
+    console.log('Email sent for ticket ' + ticket.ticket_id + ' → ' + process.env.TICKET_TO_EMAIL);
 
-    // Mark as email_sent and add to timeline
     const timeline = ticket.timeline || [];
     timeline.push({ ts: new Date().toISOString(), msg: 'Email sent to ' + process.env.TICKET_TO_EMAIL });
-
     await supabase.from('ticket_mail')
       .update({ email_sent: true, timeline })
       .eq('ticket_id', ticket.ticket_id);
 
   } catch (err) {
-    console.error('Email send failed for ' + ticket.ticket_id + ':', err.message);
-    // Try alternate port on failure
-    if (err.message.includes('timeout') || err.message.includes('connect')) {
-      console.log('Retrying with port 587...');
-      try {
-        const t2 = nodemailer.createTransport({
-          host: process.env.MAIL_HOST, port: 587, secure: false,
-          auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
-          tls: { rejectUnauthorized: false }
-        });
-        await t2.sendMail(mailOptions);
-        console.log('Email sent via port 587 for ' + ticket.ticket_id);
-        const timeline = ticket.timeline || [];
-        timeline.push({ ts: new Date().toISOString(), msg: 'Email sent via port 587 to ' + process.env.TICKET_TO_EMAIL });
-        await supabase.from('ticket_mail').update({ email_sent: true, timeline }).eq('ticket_id', ticket.ticket_id);
-      } catch (err2) {
-        console.error('Port 587 also failed:', err2.message);
-      }
-    }
+    const detail = err.response ? JSON.stringify(err.response.body) : err.message;
+    console.error('SendGrid failed for ' + ticket.ticket_id + ':', detail);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// IMAP POLLING — check for replies and auto-close tickets
-// Runs every 3 minutes
+// IMAP POLLING — check Axxess inbox for replies (every 3 min)
 // ═══════════════════════════════════════════════════════════════
 function pollInbox() {
   console.log('Polling inbox for replies...');
   const imap = new Imap({
-    user:     process.env.MAIL_USER,
-    password: process.env.MAIL_PASS,
-    host:     process.env.MAIL_HOST,
-    port:     parseInt(process.env.MAIL_IMAP_PORT || '993'),
-    tls:      true,
+    user:       process.env.MAIL_USER,
+    password:   process.env.MAIL_PASS,
+    host:       process.env.MAIL_HOST,
+    port:       parseInt(process.env.MAIL_IMAP_PORT || '993'),
+    tls:        true,
     tlsOptions: { rejectUnauthorized: false },
     connTimeout: 10000,
     authTimeout: 10000
@@ -207,13 +177,14 @@ function pollInbox() {
       imap.search(['UNSEEN'], async (err, results) => {
         if (err || !results || results.length === 0) { imap.end(); return; }
         console.log('Found ' + results.length + ' unread message(s)');
+
         const fetch = imap.fetch(results, { bodies: '' });
         const seen  = [];
 
         fetch.on('message', (msg) => {
           let buffer = '';
           let uid;
-          msg.on('body', stream => { stream.on('data', chunk => buffer += chunk.toString('utf8')); });
+          msg.on('body', stream => { stream.on('data', c => buffer += c.toString('utf8')); });
           msg.once('attributes', attrs => { uid = attrs.uid; });
           msg.once('end', async () => {
             try {
