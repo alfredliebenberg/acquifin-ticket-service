@@ -1,174 +1,73 @@
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const nodemailer = require('nodemailer');
-const multer     = require('multer');
-const cron       = require('node-cron');
-const Imap       = require('imap');
+const express        = require('express');
+const nodemailer     = require('nodemailer');
+const cron           = require('node-cron');
+const Imap           = require('imap');
 const { simpleParser } = require('mailparser');
-const { createClient }  = require('@supabase/supabase-js');
+const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// ── Supabase ────────────────────────────────────────────────
+// ── Supabase (service role — bypasses RLS) ───────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY   // use service role key (not anon) so we bypass RLS
+  process.env.SUPABASE_SERVICE_KEY
 );
 
-// ── Multer — memory storage for attachments (max 20 MB total) ──
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }
-});
-
-// ── SMTP transporter (Axxess / cPanel) ─────────────────────
+// ── SMTP transporter ─────────────────────────────────────────
 const transporter = nodemailer.createTransport({
-  host: process.env.MAIL_HOST,          // cphost28.vpslocal.co.za
-  port: parseInt(process.env.MAIL_SMTP_PORT || '465'),
-  secure: true,                          // SSL on 465
+  host:   process.env.MAIL_HOST,
+  port:   parseInt(process.env.MAIL_SMTP_PORT || '465'),
+  secure: true,
   auth: {
-    user: process.env.MAIL_USER,         // tickets@acquifinholdings.co.za
+    user: process.env.MAIL_USER,
     pass: process.env.MAIL_PASS
   },
-  tls: { rejectUnauthorized: false }     // cPanel self-signed cert
+  tls: { rejectUnauthorized: false }
 });
 
-// ── Middleware ───────────────────────────────────────────────
-// Allow all origins including null (file:// local HTML files)
+// ── CORS — allow file:// (null origin) and everything else ───
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,apikey');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 // ── Health check ─────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'Acquifin Ticket Service running', time: new Date().toISOString() });
 });
 
-// ────────────────────────────────────────────────────────────
-// POST /ticket  — create ticket, store in Supabase, send email
-// ────────────────────────────────────────────────────────────
-app.post('/ticket', upload.array('attachments', 5), async (req, res) => {
+// ── Manual close endpoint (admin button in HTML) ─────────────
+app.post('/close/:id', async (req, res) => {
   try {
-    const {
-      id, topic, priority, description,
-      systems, cc, name, email, createdAt
-    } = req.body;
-
-    const ccList   = cc ? (typeof cc === 'string' ? JSON.parse(cc) : cc) : [];
-    const sysList  = systems ? (typeof systems === 'string' ? JSON.parse(systems) : systems) : [];
-    const files    = req.files || [];
-
-    // ── 1. Store in Supabase ──────────────────────────────
-    const attachmentMeta = files.map(f => ({ name: f.originalname, size: f.size, type: f.mimetype }));
-
-    const { error: dbErr } = await supabase
-      .from('ticket_mail')
-      .insert({
-        ticket_id:    id,
-        topic,
-        priority,
-        description,
-        systems:      sysList,
-        cc:           ccList,
-        staff_name:   name,
-        staff_email:  email,
-        created_at:   createdAt || new Date().toISOString(),
-        status:       'open',
-        closed_at:    null,
-        attachments:  attachmentMeta,
-        timeline:     [{ ts: new Date().toISOString(), msg: `Ticket created by ${name}` }]
-      });
-
-    if (dbErr) {
-      console.error('Supabase insert error:', dbErr);
-      return res.status(500).json({ error: 'Database error', detail: dbErr.message });
-    }
-
-    // ── 2. Build and send email ───────────────────────────
-    const prioLabels = {
-      critical: 'Critical — Affects all staff',
-      serious:  'Serious — Staff member unable to work',
-      medium:   'Medium — Impacts production',
-      medlow:   'Medium-Low — Within 48 hours',
-      low:      'Low — No direct production impact'
-    };
-
-    const sysLine  = sysList.length  ? `\nSystems to deactivate : ${sysList.join(', ')}` : '';
-    const ccLine   = ccList.length   ? `\nCC                    : ${ccList.join(', ')}` : '';
-
-    const bodyText =
-`ACQUIFIN HOLDINGS — SUPPORT TICKET
-═══════════════════════════════════════
-Ticket Number         : ${id}
-Topic                 : ${topic}
-Priority              : ${prioLabels[priority] || priority}
-From                  : ${name} <${email}>${ccLine}
-Date/Time             : ${new Date().toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' })}${sysLine}
-═══════════════════════════════════════
-
-DESCRIPTION:
-${description}
-
-${files.length ? `ATTACHMENTS: ${files.map(f => f.originalname).join(', ')}` : ''}
-
-───────────────────────────────────────
-To CLOSE this ticket, reply to this email.
-Your reply will automatically mark the ticket as resolved.
-
-Ticket reference: ${id}
-───────────────────────────────────────`;
-
-    const mailOptions = {
-      from:    `"Acquifin Tickets" <${process.env.MAIL_USER}>`,
-      to:      process.env.TICKET_TO_EMAIL,   // systems@bridge.co.za
-      cc:      ccList.length ? ccList.join(', ') : undefined,
-      replyTo: process.env.MAIL_USER,          // replies come back to tickets@acquifinholdings.co.za
-      subject: `[${id}] ${topic} — ${prioLabels[priority] || priority}`,
-      text:    bodyText,
-      // Keep ticket ID in headers so IMAP polling can match replies
-      headers: { 'X-Ticket-ID': id }
-    };
-
-    // Attach files
-    if (files.length) {
-      mailOptions.attachments = files.map(f => ({
-        filename:    f.originalname,
-        content:     f.buffer,
-        contentType: f.mimetype
-      }));
-    }
-
-    await transporter.sendMail(mailOptions);
-    console.log(`Ticket ${id} sent to ${process.env.TICKET_TO_EMAIL}`);
-
-    res.json({ success: true, ticket_id: id });
-
+    const ticketId = req.params.id;
+    const now = new Date().toISOString();
+    const { data: existing } = await supabase
+      .from('ticket_mail').select('timeline,created_at').eq('ticket_id', ticketId).single();
+    const timeline = existing?.timeline || [];
+    const duration = existing?.created_at ? formatDuration(new Date(now) - new Date(existing.created_at)) : '—';
+    timeline.push({ ts: now, msg: 'Ticket closed manually — resolved in ' + duration });
+    await supabase.from('ticket_mail')
+      .update({ status: 'closed', closed_at: now, timeline })
+      .eq('ticket_id', ticketId);
+    res.json({ success: true });
   } catch (err) {
-    console.error('Ticket creation error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ────────────────────────────────────────────────────────────
-// GET /tickets  — fetch tickets for the HTML frontend
-// ────────────────────────────────────────────────────────────
+// ── GET tickets (for HTML frontend sync) ─────────────────────
 app.get('/tickets', async (req, res) => {
   try {
-    const email = req.query.email;
+    const email   = req.query.email;
     const isAdmin = req.query.admin === '1';
-
     let query = supabase.from('ticket_mail').select('*').order('created_at', { ascending: false });
     if (!isAdmin && email) query = query.eq('staff_email', email);
-
     const { data, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
@@ -177,121 +76,174 @@ app.get('/tickets', async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────────────────
-// POST /close/:id  — manually close a ticket (admin)
-// ────────────────────────────────────────────────────────────
-app.post('/close/:id', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// POLL SUPABASE — pick up new tickets and send emails
+// Runs every 30 seconds
+// ═══════════════════════════════════════════════════════════════
+async function processNewTickets() {
   try {
-    const ticketId = req.params.id;
-    const now = new Date().toISOString();
-
-    // Fetch existing ticket to append to timeline
-    const { data: existing } = await supabase
-      .from('ticket_mail').select('timeline, created_at').eq('ticket_id', ticketId).single();
-
-    const timeline = existing?.timeline || [];
-    const created  = existing?.created_at;
-    const duration = created ? formatDuration(new Date(now) - new Date(created)) : '—';
-
-    timeline.push({ ts: now, msg: `Ticket closed manually — resolved in ${duration}` });
-
-    const { error } = await supabase
+    // Find tickets that haven't had emails sent yet
+    const { data: tickets, error } = await supabase
       .from('ticket_mail')
-      .update({ status: 'closed', closed_at: now, timeline })
-      .eq('ticket_id', ticketId);
+      .select('*')
+      .eq('email_sent', false)
+      .order('created_at', { ascending: true });
 
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ success: true });
+    if (error) { console.error('Supabase poll error:', error.message); return; }
+    if (!tickets || tickets.length === 0) return;
+
+    console.log('Found ' + tickets.length + ' unsent ticket(s)');
+
+    for (const ticket of tickets) {
+      await sendTicketEmail(ticket);
+    }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('processNewTickets error:', err.message);
   }
-});
+}
 
-// ────────────────────────────────────────────────────────────
-// IMAP Polling — check for replies every 3 minutes
-// ────────────────────────────────────────────────────────────
+async function sendTicketEmail(ticket) {
+  const prioLabels = {
+    critical: 'Critical — Affects all staff',
+    serious:  'Serious — Staff member unable to work',
+    medium:   'Medium — Impacts production',
+    medlow:   'Medium-Low — Within 48 hours',
+    low:      'Low — No direct production impact'
+  };
+
+  const prioLabel = prioLabels[ticket.priority] || ticket.priority;
+  const ccList    = Array.isArray(ticket.cc) ? ticket.cc : [];
+  const sysList   = Array.isArray(ticket.systems) ? ticket.systems : [];
+  const sysLine   = sysList.length  ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
+  const ccLine    = ccList.length   ? '\nCC                    : ' + ccList.join(', ')  : '';
+
+  const bodyText =
+`ACQUIFIN HOLDINGS — SUPPORT TICKET
+═══════════════════════════════════════
+Ticket Number         : ${ticket.ticket_id}
+Topic                 : ${ticket.topic}
+Priority              : ${prioLabel}
+From                  : ${ticket.staff_name} <${ticket.staff_email}>${ccLine}
+Date/Time             : ${new Date(ticket.created_at).toLocaleString('en-ZA', { timeZone: 'Africa/Johannesburg' })}${sysLine}
+═══════════════════════════════════════
+
+DESCRIPTION:
+${ticket.description}
+
+───────────────────────────────────────
+To CLOSE this ticket, simply reply to this email.
+Your reply will automatically mark the ticket as resolved.
+
+Ticket reference: ${ticket.ticket_id}
+───────────────────────────────────────`;
+
+  const mailOptions = {
+    from:    '"Acquifin Tickets" <' + process.env.MAIL_USER + '>',
+    to:      process.env.TICKET_TO_EMAIL,
+    cc:      ccList.length ? ccList.join(', ') : undefined,
+    replyTo: process.env.MAIL_USER,
+    subject: '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
+    text:    bodyText,
+    headers: { 'X-Ticket-ID': ticket.ticket_id }
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log('Email sent for ticket ' + ticket.ticket_id);
+
+    // Mark as email_sent and add to timeline
+    const timeline = ticket.timeline || [];
+    timeline.push({ ts: new Date().toISOString(), msg: 'Email sent to ' + process.env.TICKET_TO_EMAIL });
+
+    await supabase.from('ticket_mail')
+      .update({ email_sent: true, timeline })
+      .eq('ticket_id', ticket.ticket_id);
+
+  } catch (err) {
+    console.error('Email send failed for ' + ticket.ticket_id + ':', err.message);
+    // Try alternate port on failure
+    if (err.message.includes('timeout') || err.message.includes('connect')) {
+      console.log('Retrying with port 587...');
+      try {
+        const t2 = nodemailer.createTransport({
+          host: process.env.MAIL_HOST, port: 587, secure: false,
+          auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
+          tls: { rejectUnauthorized: false }
+        });
+        await t2.sendMail(mailOptions);
+        console.log('Email sent via port 587 for ' + ticket.ticket_id);
+        const timeline = ticket.timeline || [];
+        timeline.push({ ts: new Date().toISOString(), msg: 'Email sent via port 587 to ' + process.env.TICKET_TO_EMAIL });
+        await supabase.from('ticket_mail').update({ email_sent: true, timeline }).eq('ticket_id', ticket.ticket_id);
+      } catch (err2) {
+        console.error('Port 587 also failed:', err2.message);
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IMAP POLLING — check for replies and auto-close tickets
+// Runs every 3 minutes
+// ═══════════════════════════════════════════════════════════════
 function pollInbox() {
-  console.log('Polling inbox for ticket replies...');
-
+  console.log('Polling inbox for replies...');
   const imap = new Imap({
     user:     process.env.MAIL_USER,
     password: process.env.MAIL_PASS,
     host:     process.env.MAIL_HOST,
     port:     parseInt(process.env.MAIL_IMAP_PORT || '993'),
     tls:      true,
-    tlsOptions: { rejectUnauthorized: false }
+    tlsOptions: { rejectUnauthorized: false },
+    connTimeout: 10000,
+    authTimeout: 10000
   });
 
-  imap.once('error', err => {
-    console.error('IMAP error:', err.message);
-  });
+  imap.once('error', err => console.error('IMAP error:', err.message));
 
   imap.once('ready', () => {
-    imap.openBox('INBOX', false, (err, box) => {
+    imap.openBox('INBOX', false, (err) => {
       if (err) { imap.end(); return; }
-
-      // Search for unread messages
       imap.search(['UNSEEN'], async (err, results) => {
-        if (err || !results || results.length === 0) {
-          imap.end();
-          return;
-        }
-
-        console.log(`Found ${results.length} unread message(s)`);
+        if (err || !results || results.length === 0) { imap.end(); return; }
+        console.log('Found ' + results.length + ' unread message(s)');
         const fetch = imap.fetch(results, { bodies: '' });
-        const processed = [];
+        const seen  = [];
 
-        fetch.on('message', (msg, seqno) => {
+        fetch.on('message', (msg) => {
           let buffer = '';
-          msg.on('body', stream => {
-            stream.on('data', chunk => buffer += chunk.toString('utf8'));
-          });
-
-          msg.once('attributes', attrs => {
-            msg._uid = attrs.uid;
-          });
-
+          let uid;
+          msg.on('body', stream => { stream.on('data', chunk => buffer += chunk.toString('utf8')); });
+          msg.once('attributes', attrs => { uid = attrs.uid; });
           msg.once('end', async () => {
             try {
-              const parsed = await simpleParser(buffer);
+              const parsed  = await simpleParser(buffer);
               const subject = parsed.subject || '';
               const from    = parsed.from?.text || '';
-              const text    = parsed.text || '';
-
-              // Extract ticket ID from subject line e.g. [TKT-2506-1234]
-              const match = subject.match(/\[?(TKT-\d{4}-\d{4})\]?/i);
+              const match   = subject.match(/\[?(TKT-\d{4}-\d{4})\]?/i);
               if (!match) return;
 
               const ticketId = match[1];
-              console.log(`Reply detected for ticket ${ticketId} from ${from}`);
+              console.log('Reply for ticket ' + ticketId + ' from ' + from);
 
-              // Fetch ticket from Supabase
               const { data: ticket } = await supabase
-                .from('ticket_mail')
-                .select('*')
-                .eq('ticket_id', ticketId)
-                .single();
-
+                .from('ticket_mail').select('*').eq('ticket_id', ticketId).single();
               if (!ticket || ticket.status === 'closed') return;
 
               const now      = new Date().toISOString();
               const duration = formatDuration(new Date(now) - new Date(ticket.created_at));
               const timeline = ticket.timeline || [];
-
               timeline.push({
                 ts:  now,
-                msg: `Reply received from ${from} — ticket automatically closed. Resolved in ${duration}.`,
-                reply_excerpt: text.substring(0, 300)
+                msg: 'Reply received from ' + from + ' — ticket auto-closed. Resolved in ' + duration + '.'
               });
 
-              await supabase
-                .from('ticket_mail')
+              await supabase.from('ticket_mail')
                 .update({ status: 'closed', closed_at: now, timeline })
                 .eq('ticket_id', ticketId);
 
-              console.log(`Ticket ${ticketId} auto-closed. Duration: ${duration}`);
-              processed.push(msg._uid);
-
+              console.log('Ticket ' + ticketId + ' closed. Duration: ' + duration);
+              if (uid) seen.push(uid);
             } catch (e) {
               console.error('Parse error:', e.message);
             }
@@ -299,12 +251,7 @@ function pollInbox() {
         });
 
         fetch.once('end', () => {
-          // Mark processed messages as seen
-          if (processed.length) {
-            imap.setFlags(processed, ['\\Seen'], err => {
-              if (err) console.error('Flag error:', err);
-            });
-          }
+          if (seen.length) imap.setFlags(seen, ['\\Seen'], () => {});
           imap.end();
         });
       });
@@ -315,21 +262,20 @@ function pollInbox() {
 }
 
 function formatDuration(ms) {
-  const totalMin = Math.floor(ms / 60000);
-  if (totalMin < 60) return `${totalMin} min`;
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  if (h < 24) return `${h}h ${m}m`;
-  const d = Math.floor(h / 24);
-  return `${d}d ${h % 24}h`;
+  const m = Math.floor(Math.abs(ms) / 60000);
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
 }
 
-// Run poll every 3 minutes
-cron.schedule('*/3 * * * *', pollInbox);
+// ── Schedules ─────────────────────────────────────────────────
+cron.schedule('*/30 * * * * *', processNewTickets);  // every 30 seconds
+cron.schedule('*/3 * * * *',    pollInbox);           // every 3 minutes
 
-// ── Start server ─────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────
 app.listen(port, () => {
-  console.log(`Acquifin Ticket Service running on port ${port}`);
-  // Initial poll on startup
+  console.log('Acquifin Ticket Service running on port ' + port);
+  setTimeout(processNewTickets, 3000);
   setTimeout(pollInbox, 5000);
 });
