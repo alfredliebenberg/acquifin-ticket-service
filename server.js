@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express        = require('express');
-const sgMail         = require('@sendgrid/mail');
+const nodemailer     = require('nodemailer');
 const cron           = require('node-cron');
 const Imap           = require('imap');
 const { simpleParser } = require('mailparser');
@@ -9,14 +9,22 @@ const { createClient } = require('@supabase/supabase-js');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// ── SendGrid ─────────────────────────────────────────────────
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
 // ── Supabase (service role) ──────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
+
+// ── Gmail SMTP transporter ───────────────────────────────────
+const transporter = nodemailer.createTransport({
+  host:   'smtp.gmail.com',
+  port:   465,
+  secure: true,
+  auth: {
+    user: process.env.MAIL_USER,   // acquifin.tickets@gmail.com
+    pass: process.env.MAIL_PASS    // 16-char app password
+  }
+});
 
 // ── Middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -33,7 +41,45 @@ app.get('/', (req, res) => {
   res.json({ status: 'Acquifin Ticket Service running', time: new Date().toISOString() });
 });
 
-// ── Manual close (admin) ─────────────────────────────────────
+// ── One-click close link ─────────────────────────────────────
+app.get('/close-link/:id', async (req, res) => {
+  const ticketId = req.params.id;
+  try {
+    const now = new Date().toISOString();
+    const { data: existing } = await supabase
+      .from('ticket_mail').select('timeline,created_at,status').eq('ticket_id', ticketId).single();
+
+    if (!existing) return res.send('<h2>Ticket not found: ' + ticketId + '</h2>');
+
+    if (existing.status === 'closed') {
+      return res.send('<html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;text-align:center">' +
+        '<h2>✅ Already Closed</h2><p>Ticket <strong>' + ticketId + '</strong> was already closed.</p></body></html>');
+    }
+
+    const timeline = existing.timeline || [];
+    const duration = existing.created_at ? formatDuration(new Date(now) - new Date(existing.created_at)) : '—';
+    timeline.push({ ts: now, msg: 'Ticket closed via email link — resolved in ' + duration });
+
+    await supabase.from('ticket_mail')
+      .update({ status: 'closed', closed_at: now, timeline })
+      .eq('ticket_id', ticketId);
+
+    console.log('Ticket ' + ticketId + ' closed via link. Duration: ' + duration);
+
+    res.send('<html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;text-align:center;padding:20px">' +
+      '<div style="font-size:60px">✅</div>' +
+      '<h2 style="color:#0B1F3A">Ticket Closed</h2>' +
+      '<p><strong>' + ticketId + '</strong> has been marked as resolved.</p>' +
+      '<p style="color:#666;font-size:14px">Resolved in ' + duration + '</p>' +
+      '<p style="color:#888;font-size:12px;margin-top:30px">Acquifin Holdings — Ticket System</p>' +
+      '</body></html>');
+  } catch (err) {
+    console.error('Close-link error:', err.message);
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// ── Manual close (admin button) ──────────────────────────────
 app.post('/close/:id', async (req, res) => {
   try {
     const ticketId = req.params.id;
@@ -52,7 +98,7 @@ app.post('/close/:id', async (req, res) => {
   }
 });
 
-// ── GET tickets ──────────────────────────────────────────────
+// ── GET tickets (frontend sync) ──────────────────────────────
 app.get('/tickets', async (req, res) => {
   try {
     const email   = req.query.email;
@@ -99,11 +145,12 @@ async function sendTicketEmail(ticket) {
     low:      'Low — No direct production impact'
   };
 
-  const prioLabel = prioLabels[ticket.priority] || ticket.priority;
-  const ccList    = Array.isArray(ticket.cc)      ? ticket.cc      : [];
-  const sysList   = Array.isArray(ticket.systems) ? ticket.systems : [];
-  const sysLine   = sysList.length ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
-  const ccLine    = ccList.length  ? '\nCC                    : ' + ccList.join(', ')  : '';
+  const prioLabel  = prioLabels[ticket.priority] || ticket.priority;
+  const ccList     = Array.isArray(ticket.cc)      ? ticket.cc      : [];
+  const sysList    = Array.isArray(ticket.systems) ? ticket.systems : [];
+  const sysLine    = sysList.length ? '\nSystems to deactivate : ' + sysList.join(', ') : '';
+  const ccLine     = ccList.length  ? '\nCC                    : ' + ccList.join(', ')  : '';
+  const closeLink  = 'https://fortunate-flow-production-d5e8.up.railway.app/close-link/' + ticket.ticket_id;
 
   const bodyText =
 `ACQUIFIN HOLDINGS — SUPPORT TICKET
@@ -119,27 +166,27 @@ DESCRIPTION:
 ${ticket.description}
 
 ───────────────────────────────────────
-To CLOSE this ticket, simply reply to this email.
-Your reply will automatically mark the ticket as resolved.
+CLOSE THIS TICKET:
+${closeLink}
+
+Click the link above once resolved.
+The ticket will be marked as closed automatically.
 
 Ticket reference: ${ticket.ticket_id}
 ───────────────────────────────────────`;
 
-  const msg = {
-    to:       process.env.TICKET_TO_EMAIL,
-    from: {
-      email:  process.env.MAIL_USER,           // tickets@acquifinholdings.co.za
-      name:   'Acquifin Tickets'
-    },
-    cc:       ccList.length ? ccList : undefined,
-    replyTo:  process.env.MAIL_USER,
-    subject:  '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
-    text:     bodyText,
+  const mailOptions = {
+    from:    '"Acquifin Tickets" <' + process.env.MAIL_USER + '>',
+    to:      process.env.TICKET_TO_EMAIL,
+    cc:      ccList.length ? ccList.join(', ') : undefined,
+    replyTo: process.env.MAIL_USER,
+    subject: '[' + ticket.ticket_id + '] ' + ticket.topic + ' — ' + prioLabel,
+    text:    bodyText
   };
 
   try {
-    await sgMail.send(msg);
-    console.log('Email sent for ticket ' + ticket.ticket_id + ' → ' + process.env.TICKET_TO_EMAIL);
+    await transporter.sendMail(mailOptions);
+    console.log('✅ Email sent: ' + ticket.ticket_id + ' → ' + process.env.TICKET_TO_EMAIL);
 
     const timeline = ticket.timeline || [];
     timeline.push({ ts: new Date().toISOString(), msg: 'Email sent to ' + process.env.TICKET_TO_EMAIL });
@@ -148,21 +195,19 @@ Ticket reference: ${ticket.ticket_id}
       .eq('ticket_id', ticket.ticket_id);
 
   } catch (err) {
-    const detail = err.response ? JSON.stringify(err.response.body) : err.message;
-    console.error('SendGrid failed for ' + ticket.ticket_id + ':', detail);
+    console.error('❌ Email failed for ' + ticket.ticket_id + ':', err.message);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// IMAP POLLING — check Axxess inbox for replies (every 3 min)
+// IMAP — poll Gmail inbox for replies (every 3 minutes)
 // ═══════════════════════════════════════════════════════════════
 function pollInbox() {
-  console.log('Polling inbox for replies...');
   const imap = new Imap({
     user:       process.env.MAIL_USER,
     password:   process.env.MAIL_PASS,
-    host:       process.env.MAIL_HOST,
-    port:       parseInt(process.env.MAIL_IMAP_PORT || '993'),
+    host:       'imap.gmail.com',
+    port:       993,
     tls:        true,
     tlsOptions: { rejectUnauthorized: false },
     connTimeout: 10000,
@@ -176,7 +221,7 @@ function pollInbox() {
       if (err) { imap.end(); return; }
       imap.search(['UNSEEN'], async (err, results) => {
         if (err || !results || results.length === 0) { imap.end(); return; }
-        console.log('Found ' + results.length + ' unread message(s)');
+        console.log('📬 ' + results.length + ' unread message(s)');
 
         const fetch = imap.fetch(results, { bodies: '' });
         const seen  = [];
@@ -195,7 +240,7 @@ function pollInbox() {
               if (!match) return;
 
               const ticketId = match[1];
-              console.log('Reply for ticket ' + ticketId + ' from ' + from);
+              console.log('Reply for ' + ticketId + ' from ' + from);
 
               const { data: ticket } = await supabase
                 .from('ticket_mail').select('*').eq('ticket_id', ticketId).single();
@@ -204,16 +249,13 @@ function pollInbox() {
               const now      = new Date().toISOString();
               const duration = formatDuration(new Date(now) - new Date(ticket.created_at));
               const timeline = ticket.timeline || [];
-              timeline.push({
-                ts:  now,
-                msg: 'Reply received from ' + from + ' — ticket auto-closed. Resolved in ' + duration + '.'
-              });
+              timeline.push({ ts: now, msg: 'Reply from ' + from + ' — auto-closed. Resolved in ' + duration });
 
               await supabase.from('ticket_mail')
                 .update({ status: 'closed', closed_at: now, timeline })
                 .eq('ticket_id', ticketId);
 
-              console.log('Ticket ' + ticketId + ' closed. Duration: ' + duration);
+              console.log('✅ Ticket ' + ticketId + ' auto-closed. Duration: ' + duration);
               if (uid) seen.push(uid);
             } catch (e) {
               console.error('Parse error:', e.message);
@@ -246,7 +288,7 @@ cron.schedule('*/3 * * * *',    pollInbox);           // every 3 minutes
 
 // ── Start ─────────────────────────────────────────────────────
 app.listen(port, () => {
-  console.log('Acquifin Ticket Service running on port ' + port);
+  console.log('🚀 Acquifin Ticket Service running on port ' + port);
   setTimeout(processNewTickets, 3000);
-  setTimeout(pollInbox, 5000);
+  setTimeout(pollInbox, 8000);
 });
